@@ -10,11 +10,12 @@
 //
 // Control model
 // -------------
-//   * Asserting PS_ON# turns the PSU on; the BC250 is expected to power up from
-//     applied power (BIOS "restore on AC power"), so PSU on == board boots.
-//   * We have no wire to the board's power button, so "turning the board off"
-//     means cutting PSU power via PS_ON#. This is a hard power-off, not a
-//     graceful OS shutdown.
+//   * Asserting PS_ON# (through a low-side FET) turns the PSU on. If the BC250
+//     doesn't come up by itself (BIOS "restore on AC power" not set) we tap its
+//     power button a couple of seconds later to start it.
+//   * A wire to the board's power-button input (PWRBTN#) lets us tap it. The OS
+//     sees that as an ACPI power event and shuts down gracefully; we then follow
+//     TPMS1 down as below. Cutting PS_ON# directly is kept as a hard-off fallback.
 //   * If the board shuts itself down (e.g. OS shutdown), TPMS1 drops to 0 while
 //     the PSU is still energized. We detect that and release PS_ON# so the PSU
 //     follows the board down.
@@ -25,6 +26,7 @@ enum PowerState {
   STATE_OFF,      // PSU released, board down
   STATE_BOOTING,  // PSU asserted, waiting for TPMS1 to go HIGH
   STATE_ON,       // PSU asserted, board up (TPMS1 HIGH)
+  STATE_SHUTDOWN, // PWRBTN# tapped, waiting for the OS to take TPMS1 LOW
 };
 
 static PowerState state = STATE_OFF;
@@ -35,8 +37,16 @@ static bool          buttonLastRaw     = false;
 static unsigned long buttonLastChange  = 0;
 static unsigned long pressStart        = 0;
 static bool          pressStartedOff   = false;  // press began while OFF
-static bool          longPressFired    = false;
+static bool          longPressFired    = false;  // ACPI shutdown requested
+static bool          forceOffFired     = false;  // hard PSU cut
 static bool          setupFired        = false;
+
+// --- Board power-button pulse (non-blocking) ---
+static bool          pwrBtnActive      = false;  // PWRBTN# currently held LOW
+static unsigned long pwrBtnStart       = 0;
+static unsigned long pwrBtnHoldMs      = 0;      // length of the current press
+static bool          pwrBtnPulsedSinceHb = false; // latched for the heartbeat
+static unsigned long shutdownStart     = 0;
 
 // --- Board-sense debounce ---
 static bool          boardSenseStable  = false;  // debounced TPMS1 HIGH
@@ -52,6 +62,8 @@ static unsigned long          bleInhibitUntil = 0;  // wakes ignored until this
 
 // --- Misc timers ---
 static unsigned long bootStart    = 0;
+static unsigned long lastBootKick = 0;      // when PWRBTN# was last pressed while BOOTING
+static int           bootKicks    = 0;      // presses so far this boot attempt
 static unsigned long lastHeartbeat = 0;
 
 static const char *stateName(PowerState s) {
@@ -59,6 +71,7 @@ static const char *stateName(PowerState s) {
     case STATE_OFF:     return "OFF";
     case STATE_BOOTING: return "BOOTING";
     case STATE_ON:      return "ON";
+    case STATE_SHUTDOWN: return "SHUTDOWN";
   }
   return "?";
 }
@@ -93,12 +106,29 @@ static bool readBoardSense(uint32_t *outMv = nullptr) {
 
 static void psuOn() {
   digitalWrite(PS_ON_PIN, PS_ON_ASSERT);
-  Serial.println("[PSU ] PS_ON# asserted (LOW) -> PSU ON");
+  Serial.println("[PSU ] PS_ON# asserted -> PSU ON");
 }
 
 static void psuOff() {
   digitalWrite(PS_ON_PIN, PS_ON_RELEASE);
-  Serial.println("[PSU ] PS_ON# released (high-Z) -> PSU OFF");
+  Serial.println("[PSU ] PS_ON# released -> PSU OFF");
+}
+
+// Press the board's power button: pull PWRBTN# LOW now; normalLoop() releases
+// it after holdMs so the debounce/sense sampling never stalls.
+static void pwrBtnPress(unsigned long now, unsigned long holdMs) {
+  digitalWrite(PWR_BTN_PIN, PWR_BTN_PRESS);
+  pwrBtnActive = true;
+  pwrBtnPulsedSinceHb = true;
+  pwrBtnStart = now;
+  pwrBtnHoldMs = holdMs;
+  Serial.printf("[PWRB] PWRBTN# pressed (%lu ms)\n", holdMs);
+}
+
+static void pwrBtnRelease() {
+  digitalWrite(PWR_BTN_PIN, PWR_BTN_RELEASE);
+  pwrBtnActive = false;
+  Serial.println("[PWRB] PWRBTN# released");
 }
 
 // Shared power-on path, used by both the button and the BLE wake. Takes the
@@ -111,7 +141,17 @@ static void powerOn(const char *reason, unsigned long now) {
   Serial.printf("[ACT ] %s -> powering on\n", reason);
   psuOn();
   bootStart = now;
+  bootKicks = 0;
   setState(STATE_BOOTING);
+}
+
+// Ask the OS to shut down: tap PWRBTN# and wait for TPMS1 to drop. The PSU is
+// only released once the board is actually down (STATE_ON/SHUTDOWN handling).
+static void requestShutdown(const char *reason, unsigned long now) {
+  Serial.printf("[ACT ] %s -> requesting ACPI shutdown\n", reason);
+  pwrBtnPress(now, PWR_BTN_PULSE_MS);
+  shutdownStart = now;
+  setState(STATE_SHUTDOWN);
 }
 
 // Shared power-off path. Starts the BLE-wake cooldown so the controller's
@@ -119,6 +159,7 @@ static void powerOn(const char *reason, unsigned long now) {
 // the same single-clock-per-loop reason as powerOn().
 static void powerOff(const char *reason, unsigned long now) {
   Serial.printf("[ACT ] %s -> powering off\n", reason);
+  if (pwrBtnActive) pwrBtnRelease();  // never leave PWRBTN# held across a cut
   psuOff();
   bleInhibitUntil = now + BLE_WAKE_COOLDOWN_MS;
   setState(STATE_OFF);
@@ -180,13 +221,14 @@ static bool debounce(bool raw, bool *stable, bool *lastRaw,
 static void normalBegin() {
   Serial.println("=== BC250 PSU controller ===");
 
-  // PS_ON# open-drain, released by default so the PSU stays off at boot.
-  pinMode(PS_ON_PIN, OUTPUT_OPEN_DRAIN);
+  // MOSFET gate drives. Write the released level *before* switching the pin to
+  // output so there's no glitch through the FET on the way from high-Z.
   digitalWrite(PS_ON_PIN, PS_ON_RELEASE);
+  pinMode(PS_ON_PIN, OUTPUT);
+  digitalWrite(PWR_BTN_PIN, PWR_BTN_RELEASE);
+  pinMode(PWR_BTN_PIN, OUTPUT);
 
-  // Switch: GPIO6 = local ground, GPIO5 = sensed input with pull-up.
-  pinMode(BUTTON_GND, OUTPUT);
-  digitalWrite(BUTTON_GND, LOW);
+  // Switch: sensed input with pull-up, other side of the switch on GND.
   pinMode(BUTTON_SENSE, INPUT_PULLUP);
 
   // TPMS1 sense: read as ADC over the full 0-3.3V range.
@@ -249,6 +291,7 @@ static void normalLoop() {
       pressStart = now;
       pressStartedOff = (state == STATE_OFF);
       longPressFired = false;
+      forceOffFired = false;
       setupFired = false;
       Serial.println("[BTN ] pressed");
     } else {
@@ -272,9 +315,21 @@ static void normalLoop() {
   }
   if (buttonStable && !pressStartedOff && !longPressFired && state == STATE_ON &&
       (now - pressStart) >= LONG_PRESS_MS) {
-    // Long hold that began while ON -> force off.
+    // Long hold that began while ON -> tap the board's power button so the OS
+    // shuts down cleanly. Keep holding for the hard cut below.
     longPressFired = true;
-    powerOff("long press (>5s) while ON", now);
+    requestShutdown("long press (>5s) while ON", now);
+  }
+  if (buttonStable && !pressStartedOff && !forceOffFired && state != STATE_OFF &&
+      (now - pressStart) >= FORCE_OFF_HOLD_MS) {
+    // Even longer hold -> cut the PSU regardless (hung OS, stuck boot, etc).
+    forceOffFired = true;
+    powerOff("long hold (>10s), forcing PSU off", now);
+  }
+
+  // --- Board power-button pulse timeout ---
+  if (pwrBtnActive && (now - pwrBtnStart) >= pwrBtnHoldMs) {
+    pwrBtnRelease();
   }
 
   // --- BLE controller wake ("machine follows controller") ---
@@ -302,6 +357,17 @@ static void normalLoop() {
         setState(STATE_ON);
       } else if ((now - bootStart) >= BOOT_TIMEOUT_MS) {
         powerOff("boot timed out, board never signalled UP", now);
+      } else if (!pwrBtnActive &&
+                 (bootKicks == 0 ? (now - bootStart) >= BOOT_KICK_DELAY_MS
+                                 : (now - lastBootKick) >= BOOT_KICK_RETRY_MS)) {
+        // PSU is on and the board is still in S5 (auto-power-on jumper off):
+        // press its power button. Keep pressing periodically until TPMS1
+        // comes up or the boot times out.
+        bootKicks++;
+        lastBootKick = now;
+        Serial.printf("[ACT ] board still down after PSU on -> pressing PWRBTN# (%d)\n",
+                      bootKicks);
+        pwrBtnPress(now, BOOT_KICK_PULSE_MS);
       }
       break;
 
@@ -309,6 +375,17 @@ static void normalLoop() {
       // Board dropped TPMS1 on its own (OS shutdown / crash) -> follow it down.
       if (boardChanged && !boardSenseStable) {
         powerOff("TPMS1 LOW while ON, board shut down", now);
+      }
+      break;
+
+    case STATE_SHUTDOWN:
+      // We asked the OS to shut down; wait for the board to actually go down.
+      if (boardChanged && !boardSenseStable) {
+        powerOff("TPMS1 LOW after ACPI request, board shut down", now);
+      } else if ((now - shutdownStart) >= SHUTDOWN_TIMEOUT_MS) {
+        Serial.println("[WARN] board still up after ACPI request; "
+                       "request ignored or cancelled -> back to ON");
+        setState(STATE_ON);
       }
       break;
 
@@ -320,11 +397,23 @@ static void normalLoop() {
   // --- Heartbeat ---
   if (now - lastHeartbeat >= HEARTBEAT_MS) {
     lastHeartbeat = now;
-    Serial.printf("[HB  ] state=%s board=%s btn=%s ble=%s | sense: %umV (%s)\n",
+    // FET states are read back from the GPIO output latch, so they reflect
+    // what the gates are actually being driven to rather than our bookkeeping.
+    // Q1 is only ever on for a PWR_BTN_PULSE_MS blip, far shorter than the
+    // heartbeat period, so a plain sample would almost always miss it. Report
+    // "pulsed" if it fired at any point since the previous heartbeat.
+    bool psOnFet   = (digitalRead(PS_ON_PIN)   == PS_ON_ASSERT);
+    bool pwrBtnFet = (digitalRead(PWR_BTN_PIN) == PWR_BTN_PRESS);
+    const char *q1 = pwrBtnFet ? "on" : (pwrBtnPulsedSinceHb ? "pulsed" : "off");
+    pwrBtnPulsedSinceHb = false;
+    Serial.printf("[HB  ] state=%s board=%s btn=%s ble=%s "
+                  "| Q2/PS_ON=%s Q1/PWRBTN=%s | sense: %umV (%s)\n",
                   stateName(state),
                   boardSenseStable ? "UP" : "DOWN",
                   buttonStable ? "down" : "up",
                   blePresent ? "present" : "absent",
+                  psOnFet ? "on" : "off",
+                  q1,
                   senseMv, boardRaw ? "high" : "low");
   }
 }

@@ -219,11 +219,12 @@ static void handleFinish(AsyncWebServerRequest *req) {
 void portalBegin() {
   Serial.println("=== BC250 PSU controller : SETUP MODE ===");
 
-  // Keep the PSU off and the button readable while configuring.
-  pinMode(PS_ON_PIN, OUTPUT_OPEN_DRAIN);
+  // Keep both FETs off (PSU off, PWRBTN# released) and the button readable
+  // while configuring.
   digitalWrite(PS_ON_PIN, PS_ON_RELEASE);
-  pinMode(BUTTON_GND, OUTPUT);
-  digitalWrite(BUTTON_GND, LOW);
+  pinMode(PS_ON_PIN, OUTPUT);
+  digitalWrite(PWR_BTN_PIN, PWR_BTN_RELEASE);
+  pinMode(PWR_BTN_PIN, OUTPUT);
   pinMode(BUTTON_SENSE, INPUT_PULLUP);
 
   if (!SPIFFS.begin(true)) {
